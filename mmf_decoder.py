@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MMF Decoder 
+MMF decoder
 """
 
 import struct
@@ -9,10 +9,8 @@ import subprocess
 import argparse
 import sys
 from pathlib import Path
-from tqdm import tqdm
 
-class FixedHeaderMMFDecoder:
-    """MMF decoder with specification-compliant fixed header sizes"""
+class AdaptiveMMFDecoder:
     
     def __init__(self, mmf_path):
         self.mmf_path = Path(mmf_path)
@@ -23,6 +21,10 @@ class FixedHeaderMMFDecoder:
         self.stacks = []
         self.total_frames = 0
         
+        # Frame dimensions (determined from first stack)
+        self.frame_width = None
+        self.frame_height = None
+        
         # Cache for loaded data
         self.stack_data = {}  # Cache for complete stack data
         
@@ -30,23 +32,36 @@ class FixedHeaderMMFDecoder:
         print(f"File size: {self.file_size / (1024*1024):.1f} MB")
         
     def parse_file(self):
-        """Parse the complete MMF file structure with fixed header sizes"""
+        """Parse the complete MMF file structure"""
         with open(self.mmf_path, 'rb') as f:
-            # Read main header (FIXED: exactly 10240 bytes)
-            self.header = self._read_main_header_fixed(f)
+            # Read main header
+            self.header = self._read_main_header(f)
             print(f"Header: {self.header['description'][:50]}...")
             
             # Parse all stacks
             frame_offset = 0
             while f.tell() < self.file_size:
                 try:
-                    stack_info = self._read_stack_header_fixed(f)
+                    stack_info = self._read_stack_header(f)
                     if stack_info is None:
                         break
                     
                     stack_info['start_frame'] = frame_offset
                     stack_info['end_frame'] = frame_offset + stack_info['nframes'] - 1
                     frame_offset += stack_info['nframes']
+                    
+                    # Get frame dimensions from first stack
+                    if self.frame_width is None or self.frame_height is None:
+                        current_pos = f.tell()
+                        f.seek(stack_info['data_start'])
+                        
+                        # Read first image to get dimensions
+                        test_image, file_info = self._read_ipl_image_with_widthstep(f)
+                        if test_image is not None:
+                            self.frame_height, self.frame_width = test_image.shape
+                            print(f"Detected frame dimensions: {self.frame_width}x{self.frame_height}")
+                        
+                        f.seek(current_pos)
                     
                     # Cache BRI frame positions for this stack (during parsing)
                     current_pos = f.tell()
@@ -65,139 +80,71 @@ class FixedHeaderMMFDecoder:
                     f.seek(next_pos)
                     
                 except Exception as e:
-                    print(f"Warning: Error parsing stack: {e}")
+                    print(f"Error parsing stack: {e}")
                     break
             
             self.total_frames = frame_offset
             print(f"Found {len(self.stacks)} stacks with {self.total_frames} total frames")
+            if self.frame_width and self.frame_height:
+                print(f"Frame dimensions: {self.frame_width}x{self.frame_height}")
     
-    def _read_main_header_fixed(self, f):
-        """Read main MMF header with FIXED 10240 byte size per specification"""
+    def _read_main_header(self, f):
+        """Read the main MMF file header"""
         f.seek(0)
-        header_start = f.tell()
+        pos = f.tell()
         
-        # Read the entire 10240 byte header as per specification
-        header_data = f.read(10240)
-        if len(header_data) < 10240:
-            raise ValueError("File too small for MMF main header (expected 10240 bytes)")
+        # Read description until null
+        description = b""
+        while True:
+            byte = f.read(1)
+            if not byte or byte == b'\x00':
+                break
+            description += byte
         
-        # Find null terminator for description
-        null_pos = header_data.find(b'\x00')
-        if null_pos < 0:
-            raise ValueError("Invalid MMF header: no null terminator found")
+        # Read header fields
+        id_code = struct.unpack('<I', f.read(4))[0]
+        header_size = struct.unpack('<I', f.read(4))[0]
+        key_frame_interval = struct.unpack('<I', f.read(4))[0]
+        thresh_above_bg = struct.unpack('<I', f.read(4))[0]
+        thresh_below_bg = struct.unpack('<I', f.read(4))[0]
         
-        description = header_data[:null_pos].decode('utf-8', errors='ignore')
-        
-        # Parse fixed structure after null terminator
-        # Format: \0 + idcode + header_size + key_frame_interval + thresh_below + thresh_above
-        data_start = null_pos + 1
-        
-        if data_start + 20 > len(header_data):  # Need at least 20 bytes for 5 ints
-            raise ValueError("Invalid MMF header: insufficient data after description")
-        
-        # Unpack the fixed structure
-        values = struct.unpack('<5I', header_data[data_start:data_start + 20])
-        id_code, header_size, key_frame_interval, thresh_below_bg, thresh_above_bg = values
-        
-        # FIXED: Validate main header ID code per specification
-        if id_code != 0xa3d2d45d:
-            print(f"Warning: Unexpected main header ID: 0x{id_code:08x} (expected 0xa3d2d45d)")
-        
-        # FIXED: Validate header size matches specification
-        if header_size != 10240:
-            print(f"Warning: Header size mismatch: {header_size} (expected 10240)")
-        
-        # FIXED: Always position at exactly 10240 bytes regardless of claimed header size
-        f.seek(header_start + 10240)
+        # Seek to end of header
+        f.seek(pos + header_size)
         
         return {
-            'description': description,
+            'description': description.decode('utf-8', errors='ignore'),
             'id_code': id_code,
-            'header_size': 10240,  # FIXED: Always use spec size
+            'header_size': header_size,
             'key_frame_interval': key_frame_interval,
-            'thresh_below_bg': thresh_below_bg,
-            'thresh_above_bg': thresh_above_bg
+            'thresh_above_bg': thresh_above_bg,
+            'thresh_below_bg': thresh_below_bg
         }
     
-    def _read_stack_header_fixed(self, f):
-        """Read stack header with FIXED 512 byte size per specification"""
+    def _read_stack_header(self, f):
+        """Read an image stack header"""
         start_pos = f.tell()
         
         try:
-            # Read exactly 512 bytes per specification
-            header_data = f.read(512)
-            if len(header_data) < 512:
-                return None
+            id_code = struct.unpack('<I', f.read(4))[0]
+            header_size = struct.unpack('<I', f.read(4))[0]
+            stack_size = struct.unpack('<I', f.read(4))[0]
+            nframes = struct.unpack('<I', f.read(4))[0]
             
-            # Parse fixed structure from header
-            id_code, claimed_header_size, stack_size, nframes = struct.unpack('<4I', header_data[:16])
-            
-            # FIXED: Validate stack header ID code per specification
             if id_code != 0xbb67ca20:
                 return None
-            
-            # FIXED: Validate header size
-            if claimed_header_size != 512:
-                print(f"Warning: Stack header size mismatch: {claimed_header_size} (expected 512)")
+                
+            f.seek(start_pos + header_size)
             
             return {
                 'id_code': id_code,
-                'header_size': 512,  # FIXED: Always use spec size
+                'header_size': header_size,
                 'stack_size': stack_size,
                 'nframes': nframes,
                 'file_position': start_pos,
-                'data_start': start_pos + 512  # FIXED: Always 512 bytes per spec
+                'data_start': start_pos + header_size
             }
             
-        except Exception as e:
-            print(f"Error reading stack header: {e}")
-            return None
-    
-    def _read_bri_header_fixed(self, f):
-        """Read BRI header with FIXED 1024 byte size per specification"""
-        try:
-            header_start = f.tell()
-            
-            # Read exactly 1024 bytes per specification
-            header_data = f.read(1024)
-            if len(header_data) < 1024:
-                return None
-            
-            # Search for BRI magic number in header
-            bri_magic = struct.pack('<I', 0xf80921af)
-            magic_pos = header_data.find(bri_magic)
-            
-            if magic_pos < 0:
-                return None
-            
-            # Parse from magic number position
-            data_start = magic_pos
-            if data_start + 20 > len(header_data):
-                return None
-            
-            values = struct.unpack('<5I', header_data[data_start:data_start + 20])
-            id_code, claimed_header_size, cv_depth, channels, num_subimages = values
-            
-            # FIXED: Validate BRI header ID code per specification
-            if id_code != 0xf80921af:
-                return None
-            
-            # FIXED: Validate header size
-            if claimed_header_size != 1024:
-                print(f"Warning: BRI header size mismatch: {claimed_header_size} (expected 1024)")
-            
-            # FIXED: Position is already at end of header (exactly 1024 bytes per spec)
-            # No need to seek since we read exactly 1024 bytes
-            
-            return {
-                'id_code': id_code,
-                'header_size': 1024,  # FIXED: Always use spec size
-                'cv_depth': cv_depth,
-                'channels': channels,
-                'num_subimages': num_subimages
-            }
-            
-        except Exception as e:
+        except:
             return None
     
     def _get_stack_background(self, stack_idx):
@@ -227,7 +174,7 @@ class FixedHeaderMMFDecoder:
             return background, file_info
     
     def _read_ipl_image_with_widthstep(self, f):
-        """Read IplImage with proper widthStep padding handling"""
+        """Read IplImage with proper widthStep padding handling - ADAPTIVE DIMENSIONS"""
         try:
             start_pos = f.tell()
             
@@ -267,10 +214,7 @@ class FixedHeaderMMFDecoder:
             if remaining_header > 0:
                 f.read(remaining_header)
             
-            # Validate dimensions
-            if width != 2048 or height != 2048:
-                print(f"    Unexpected dimensions: {width}x{height}")
-                return None, None
+            print(f"    Image dimensions: {width}x{height}, depth: {depth}, widthStep: {widthStep}")
             
             # Determine bytes per pixel
             if depth == 8:
@@ -333,7 +277,7 @@ class FixedHeaderMMFDecoder:
         """Read complete BRI frame exactly like Java BackgroundRemovedImage"""
         try:
             # Read BRI header like Java BackgroundRemovedImageHeader
-            bri_header = self._read_bri_header_fixed(f)
+            bri_header = self._read_bri_header(f)
             if bri_header is None:
                 return background.copy()
             
@@ -347,9 +291,10 @@ class FixedHeaderMMFDecoder:
                     x, y, width, height, subimage = subimage_data
                     
                     # Apply sub-image to result (like Java insertIntoImage)
+                    # Use actual frame dimensions instead of hardcoded 2048
                     if (x >= 0 and y >= 0 and 
-                        x + width <= 2048 and 
-                        y + height <= 2048):
+                        x + width <= self.frame_width and 
+                        y + height <= self.frame_height):
                         result[y:y+height, x:x+width] = subimage
             
             return result
@@ -357,6 +302,119 @@ class FixedHeaderMMFDecoder:
         except Exception as e:
             print(f"    Error reading BRI frame: {e}")
             return background.copy()
+    
+    def _read_bri_header(self, f):
+        """Read BRI header like Java BackgroundRemovedImageHeader"""
+        try:
+            pos = f.tell()
+            
+            # Read BRI magic number
+            id_code = struct.unpack('<I', f.read(4))[0]
+            if id_code != 0xf80921af:
+                # Search for BRI magic in next bytes
+                f.seek(pos)
+                search_data = f.read(1000)
+                bri_magic = struct.pack('<I', 0xf80921af)
+                bri_pos = search_data.find(bri_magic)
+                
+                if bri_pos < 0:
+                    return None
+                    
+                f.seek(pos + bri_pos)
+                id_code = struct.unpack('<I', f.read(4))[0]
+                
+            header_size = struct.unpack('<I', f.read(4))[0]
+            cv_depth = struct.unpack('<I', f.read(4))[0]
+            channels = struct.unpack('<I', f.read(4))[0]
+            num_subimages = struct.unpack('<I', f.read(4))[0]
+            
+            # Skip rest of header like Java
+            bytes_read = 20  # We've read 5 ints
+            remaining = header_size - bytes_read
+            if remaining > 0:
+                f.read(remaining)
+            
+            return {
+                'id_code': id_code,
+                'header_size': header_size,
+                'cv_depth': cv_depth,
+                'channels': channels,
+                'num_subimages': num_subimages
+            }
+            
+        except Exception as e:
+            return None
+    
+    def _read_specific_bri_frame_cached(self, stack_idx, bri_frame_idx, background, file_info):
+        """Read a specific BRI frame using cached positions (much faster)"""
+        try:
+            stack = self.stacks[stack_idx]
+            
+            # Check if we have cached position
+            if (bri_frame_idx < len(stack['bri_positions'])):
+                position = stack['bri_positions'][bri_frame_idx]
+                
+                with open(self.mmf_path, 'rb') as f:
+                    f.seek(position)
+                    return self._read_bri_frame_complete(f, background, file_info)
+            else:
+                # Fallback to sequential reading
+                return self._read_specific_bri_frame(stack_idx, bri_frame_idx, background, file_info)
+                
+        except Exception as e:
+            print(f"    Error reading cached BRI frame: {e}")
+            return background.copy()
+    
+    def _read_specific_bri_frame(self, stack_idx, bri_frame_idx, background, file_info):
+        """Read a specific BRI frame without loading all frames"""
+        try:
+            stack = self.stacks[stack_idx]
+            
+            with open(self.mmf_path, 'rb') as f:
+                f.seek(stack['data_start'])
+                
+                # Skip background
+                bg_skip, _ = self._read_ipl_image_with_widthstep(f)
+                if bg_skip is None:
+                    return background.copy()
+                
+                # Skip to target BRI frame
+                for i in range(bri_frame_idx + 1):
+                    if i == bri_frame_idx:
+                        # Read this frame
+                        return self._read_bri_frame_complete(f, background, file_info)
+                    else:
+                        # Skip this frame by reading header and jumping
+                        self._skip_bri_frame(f)
+                
+                return background.copy()
+                
+        except Exception as e:
+            print(f"    Error reading specific BRI frame: {e}")
+            return background.copy()
+    
+    def _skip_bri_frame(self, f):
+        """Skip a BRI frame without reading it"""
+        try:
+            bri_header = self._read_bri_header(f)
+            if bri_header is None:
+                return
+            
+            # Skip all sub-images
+            for i in range(bri_header['num_subimages']):
+                # Read rectangle dimensions
+                x = struct.unpack('<I', f.read(4))[0]
+                y = struct.unpack('<I', f.read(4))[0]
+                width = struct.unpack('<I', f.read(4))[0]
+                height = struct.unpack('<I', f.read(4))[0]
+                
+                # Skip pixel data
+                bytes_per_pixel = 1  # Assume 8-bit for skipping
+                pixel_data_size = width * height * bytes_per_pixel
+                f.read(pixel_data_size)
+                
+        except Exception:
+            pass
     
     def _read_bri_subimage(self, f, file_info):
         """Read BRI sub-image exactly like Java readBRISubIm"""
@@ -417,32 +475,35 @@ class FixedHeaderMMFDecoder:
         return positions
 
     def _skip_bri_frame_fast(self, f):
-        """Fast BRI frame skipping with FIXED header sizes"""
+        """Fast BRI frame skipping with minimal reads"""
         try:
-            # FIXED: Skip exactly 1024 bytes for BRI header per spec
-            header_start = f.tell()
-            header_data = f.read(1024)
+            pos = f.tell()
             
-            if len(header_data) < 1024:
-                return False
-            
-            # Find and parse BRI header quickly
+            # Try to find BRI magic quickly
+            search_chunk = f.read(100)  # Small search chunk
             bri_magic = struct.pack('<I', 0xf80921af)
-            magic_pos = header_data.find(bri_magic)
+            bri_pos = search_chunk.find(bri_magic)
             
-            if magic_pos < 0:
-                return False
+            if bri_pos < 0:
+                # Search in larger chunk if not found
+                f.seek(pos)
+                search_chunk = f.read(1000)
+                bri_pos = search_chunk.find(bri_magic)
+                if bri_pos < 0:
+                    return False
             
-            # Parse header quickly
-            data_start = magic_pos
-            if data_start + 20 > len(header_data):
-                return False
+            # Jump to BRI header
+            f.seek(pos + bri_pos + 4)  # Skip magic
             
-            values = struct.unpack('<5I', header_data[data_start:data_start + 20])
-            id_code, header_size, cv_depth, channels, num_subimages = values
+            # Read header quickly
+            header_size = struct.unpack('<I', f.read(4))[0]
+            cv_depth = struct.unpack('<I', f.read(4))[0]
+            channels = struct.unpack('<I', f.read(4))[0]
+            num_subimages = struct.unpack('<I', f.read(4))[0]
             
-            if id_code != 0xf80921af:
-                return False
+            # Skip rest of header
+            remaining_header = max(0, header_size - 20)
+            f.read(remaining_header)
             
             # Skip all sub-images quickly
             bytes_per_pixel = 2 if cv_depth == 16 else 1
@@ -462,54 +523,6 @@ class FixedHeaderMMFDecoder:
             
         except Exception:
             return False
-
-    def _read_specific_bri_frame_cached(self, stack_idx, bri_frame_idx, background, file_info):
-        """Read a specific BRI frame using cached positions (much faster!)"""
-        try:
-            stack = self.stacks[stack_idx]
-            
-            # Check if we have cached position
-            if (bri_frame_idx < len(stack['bri_positions'])):
-                position = stack['bri_positions'][bri_frame_idx]
-                
-                with open(self.mmf_path, 'rb') as f:
-                    f.seek(position)
-                    return self._read_bri_frame_complete(f, background, file_info)
-            else:
-                # Fallback to sequential reading
-                return self._read_specific_bri_frame(stack_idx, bri_frame_idx, background, file_info)
-                
-        except Exception as e:
-            print(f"    Error reading cached BRI frame: {e}")
-            return background.copy()
-    
-    def _read_specific_bri_frame(self, stack_idx, bri_frame_idx, background, file_info):
-        """Read a specific BRI frame without loading all frames"""
-        try:
-            stack = self.stacks[stack_idx]
-            
-            with open(self.mmf_path, 'rb') as f:
-                f.seek(stack['data_start'])
-                
-                # Skip background
-                bg_skip, _ = self._read_ipl_image_with_widthstep(f)
-                if bg_skip is None:
-                    return background.copy()
-                
-                # Skip to target BRI frame
-                for i in range(bri_frame_idx + 1):
-                    if i == bri_frame_idx:
-                        # Read this frame
-                        return self._read_bri_frame_complete(f, background, file_info)
-                    else:
-                        # Skip this frame by reading header and jumping
-                        self._skip_bri_frame_fast(f)
-                
-                return background.copy()
-                
-        except Exception as e:
-            print(f"    Error reading specific BRI frame: {e}")
-            return background.copy()
     
     def read_frame(self, frame_num):
         """Read and reconstruct a specific frame (memory efficient with caching)"""
@@ -542,19 +555,24 @@ class FixedHeaderMMFDecoder:
             return self._read_specific_bri_frame_cached(target_stack_idx, frame_in_stack - 1, background, file_info)
     
     def convert_to_mp4(self, output_path, frame_rate=30, quality=28, max_frames=None):
-        """Convert MMF to MP4"""
+        """Convert MMF to MP4 with adaptive dimensions"""
+        if self.frame_width is None or self.frame_height is None:
+            print("Frame dimensions not detected")
+            return False
+            
         total_frames = min(self.total_frames, max_frames) if max_frames else self.total_frames
         
         print(f"Converting to MP4: {output_path}")
         print(f"Total frames: {total_frames}")
+        print(f"Frame dimensions: {self.frame_width}x{self.frame_height}")
         print(f"Frame rate: {frame_rate} FPS")
         
-        # FFmpeg command
+        # FFmpeg command with adaptive dimensions
         cmd = [
             'ffmpeg', '-y',
             '-f', 'rawvideo',
             '-pix_fmt', 'gray',
-            '-s', '2048x2048',
+            '-s', f'{self.frame_width}x{self.frame_height}',
             '-r', str(frame_rate),
             '-i', '-',
             '-c:v', 'libx264',
@@ -567,18 +585,19 @@ class FixedHeaderMMFDecoder:
         try:
             process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             
-            # Stream frames with progress bar
-            with tqdm(total=total_frames, desc="Converting frames", unit="frame") as pbar:
-                for frame_num in range(total_frames):
-                    frame = self.read_frame(frame_num)
-                    if frame is not None:
-                        process.stdin.write(frame.tobytes())
-                    else:
-                        # Black frame fallback
-                        black_frame = np.zeros((2048, 2048), dtype=np.uint8)
-                        process.stdin.write(black_frame.tobytes())
-                    
-                    pbar.update(1)
+            # Stream frames
+            for frame_num in range(total_frames):
+                if frame_num % 100 == 0:
+                    progress = (frame_num / total_frames) * 100
+                    print(f"Progress: {progress:.1f}% ({frame_num}/{total_frames})")
+                
+                frame = self.read_frame(frame_num)
+                if frame is not None:
+                    process.stdin.write(frame.tobytes())
+                else:
+                    # Black frame fallback with correct dimensions
+                    black_frame = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
+                    process.stdin.write(black_frame.tobytes())
             
             process.stdin.close()
             process.wait()
@@ -587,143 +606,15 @@ class FixedHeaderMMFDecoder:
                 print(f"Conversion complete: {output_path}")
                 return True
             else:
-                print(f"Error: FFmpeg failed with return code: {process.returncode}")
+                print(f"FFmpeg failed with return code: {process.returncode}")
                 return False
                 
         except Exception as e:
-            print(f"Error: Conversion failed: {e}")
+            print(f"Conversion failed: {e}")
             return False
 
-def interactive_mode():
-    """Interactive mode for users who prefer prompts over command line arguments"""
-    print("=" * 50)
-    print("MMF to MP4 Converter - Interactive Mode")
-    print("=" * 50)
-    print()
-    
-    # Get input file
-    while True:
-        input_file = input("Enter the path to your MMF file: ").strip().strip('"\'')
-        if not input_file:
-            print("Please enter a file path.")
-            continue
-            
-        input_path = Path(input_file)
-        if input_path.exists():
-            break
-        else:
-            print(f"File not found: {input_file}")
-            print("Please check the path and try again.")
-            print()
-    
-    # Get output file
-    print()
-    default_output = str(input_path.with_suffix('.mp4'))
-    output_file = input(f"Enter output MP4 file path (or press Enter for '{default_output}'): ").strip().strip('"\'')
-    if not output_file:
-        output_file = default_output
-    
-    # Get settings with explanations
-    print()
-    print("Optional Settings (press Enter to use defaults):")
-    print()
-    
-    # Frame rate with validation
-    while True:
-        fps_input = input("Frame rate (FPS) [default: 20]: ").strip()
-        if not fps_input:
-            fps = 20
-            break
-        try:
-            fps = int(fps_input)
-            if fps <= 0:
-                print("Frame rate must be a positive number. Please try again.")
-                continue
-            break
-        except ValueError:
-            print("Please enter a valid number for frame rate.")
-    
-    # Quality with validation
-    while True:
-        quality_input = input("Quality (0-51, lower=better quality) [default: 28]: ").strip()
-        if not quality_input:
-            quality = 28
-            break
-        try:
-            quality = int(quality_input)
-            if quality < 0 or quality > 51:
-                print("Quality must be between 0 and 51. Please try again.")
-                continue
-            break
-        except ValueError:
-            print("Please enter a valid number for quality (0-51).")
-    
-    # Max frames with validation
-    while True:
-        max_frames_input = input("Maximum frames to convert (for testing, leave empty for all): ").strip()
-        if not max_frames_input:
-            max_frames = None
-            break
-        try:
-            max_frames = int(max_frames_input)
-            if max_frames <= 0:
-                print("Maximum frames must be a positive number. Please try again.")
-                continue
-            break
-        except ValueError:
-            print("Please enter a valid number for maximum frames.")
-    
-    # Confirm settings
-    print()
-    print("=" * 50)
-    print("Conversion Settings:")
-    print(f"Input file:     {input_file}")
-    print(f"Output file:    {output_file}")
-    print(f"Frame rate:     {fps} FPS")
-    print(f"Quality:        {quality} (0-51 scale)")
-    if max_frames:
-        print(f"Max frames:     {max_frames}")
-    else:
-        print(f"Max frames:     All frames")
-    print("=" * 50)
-    print()
-    
-    confirm = input("Start conversion? (y/n): ").strip().lower()
-    if confirm not in ['y', 'yes']:
-        print("Conversion cancelled.")
-        return
-    
-    print()
-    print("Starting conversion...")
-    print()
-    
-    try:
-        decoder = FixedHeaderMMFDecoder(input_file)
-        decoder.parse_file()
-        
-        success = decoder.convert_to_mp4(output_file, fps, quality, max_frames)
-        
-        if success:
-            print()
-            print("=" * 50)
-            print("Conversion completed successfully!")
-            print(f"Output file: {output_file}")
-            print("=" * 50)
-        else:
-            print()
-            print("Conversion failed. Please check the error messages above.")
-            
-    except Exception as e:
-        print(f"Error: {e}")
-        print("Conversion failed.")
-
 def main():
-    # Check if no arguments provided - use interactive mode
-    if len(sys.argv) == 1:
-        interactive_mode()
-        return
-    
-    parser = argparse.ArgumentParser(description='MMF to MP4 converter with fixed header sizes')
+    parser = argparse.ArgumentParser(description='Adaptive MMF to MP4 converter')
     parser.add_argument('input_mmf', help='Input MMF file')
     parser.add_argument('output_mp4', help='Output MP4 file')
     parser.add_argument('--fps', type=int, default=20, help='Frame rate (default: 20)')
@@ -733,10 +624,10 @@ def main():
     args = parser.parse_args()
     
     if not Path(args.input_mmf).exists():
-        print(f"Error: Input file not found: {args.input_mmf}")
+        print(f"Input file not found: {args.input_mmf}")
         sys.exit(1)
     
-    decoder = FixedHeaderMMFDecoder(args.input_mmf)
+    decoder = AdaptiveMMFDecoder(args.input_mmf)
     decoder.parse_file()
     
     success = decoder.convert_to_mp4(args.output_mp4, args.fps, args.quality, args.max_frames)
